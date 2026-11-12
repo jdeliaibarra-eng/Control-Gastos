@@ -219,8 +219,26 @@ async def ultimos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Error al procesar un mensaje", exc_info=context.error)
+    if isinstance(update, Update) and update.message and es_dueña(update):
+        try:
+            await update.message.reply_text("Algo falló. Vuelve a enviarlo en un momento.")
+        except Exception:
+            pass
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("resumen", resumen))
     app.add_handler(CommandHandler("ultimos", ultimos))
     app.add_handler(MessageHandler(filters.PHOTO, on_foto))
