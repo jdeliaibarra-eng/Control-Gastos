@@ -149,6 +149,7 @@ def extraer(imagen: Optional[bytes], mime: str, texto: Optional[str]) -> Gasto:
 
 # --- Handlers de Telegram ---
 PENDIENTES: dict = {}  # gastos a personas esperando que elijas categoría
+HECHOS: list = []  # tokens ya registrados (evita avisos falsos de 'expiró' si se toca dos veces)
 
 
 def _teclado(token: str) -> InlineKeyboardMarkup:
@@ -204,14 +205,21 @@ async def registrar(mensaje, g: Gasto, fecha: str):
 
 async def on_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     if q.from_user.id != OWNER_ID:
+        await q.answer()
         return
     _, token, idx = q.data.split(":")
+    if token in HECHOS:
+        await q.answer("Ya quedó registrado")
+        return
     pendiente = PENDIENTES.pop(token, None)
     if not pendiente:
+        await q.answer()
         await q.message.edit_text("Esto ya expiró. Vuelve a enviar el voucher.")
         return
+    await q.answer()
+    HECHOS.append(token)
+    del HECHOS[:-100]
     g, fecha = pendiente
     g.categoria = CATEGORIAS[int(idx)]
     await registrar(q.message, g, fecha)
