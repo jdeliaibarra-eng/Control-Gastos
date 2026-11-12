@@ -96,7 +96,11 @@ def extraer(imagen: Optional[bytes], mime: str, texto: Optional[str]) -> Gasto:
     instruccion = (
         f"Hoy es {hoy} (zona horaria Lima, Perú). Extrae los datos del gasto. "
         "Si la fecha no aparece o no tiene año, usa el año actual o la fecha de hoy. "
-        "Si no es un comprobante de pago, pon es_gasto en false. "
+        "El texto puede ser un aviso de pago o un gasto que la persona cuenta a mano, "
+        "por ejemplo 'almuerzo 15', 'taxi 8 ayer' o 'gasté 30 en farmacia en efectivo': "
+        "en esos casos es_gasto es true, el comercio es lo que describe y la fecha es hoy "
+        "salvo que diga otra (ayer, el lunes, una fecha). "
+        "Si el texto o la imagen no tiene ningún gasto, pon es_gasto en false. "
         f"Categorías válidas: {', '.join(CATEGORIAS)}."
     )
     entrada = [{"type": "text", "text": instruccion}]
