@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import os
+import uuid
 from collections import defaultdict
 from datetime import datetime
 from typing import Optional
@@ -20,9 +21,10 @@ from zoneinfo import ZoneInfo
 import httpx
 from google import genai
 from pydantic import BaseModel, Field
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -53,6 +55,13 @@ CATEGORIAS = [
     "Transferencias",
     "Otros",
 ]
+# --- Tus reglas (puedes editarlas) ---
+# Reglas fijas en lenguaje normal: si aplican, el bot no te pregunta la categoría.
+# Ejemplos (quita el # para activarlas):
+REGLAS_EXTRA = [
+    # "Los pagos a Karla son Comida",
+    # "Los pagos a Luis son Transporte",
+]
 HEADERS = ["Fecha", "Monto", "Moneda", "Comercio", "Categoría", "Registrado"]
 
 gemini = genai.Client()  # lee GEMINI_API_KEY
@@ -67,6 +76,12 @@ class Gasto(BaseModel):
     fecha: Optional[str] = Field(description="Fecha del pago en formato YYYY-MM-DD.")
     comercio: Optional[str] = Field(description="Comercio o persona que recibió el pago.")
     categoria: str = Field(description="Una de: " + ", ".join(CATEGORIAS))
+    es_persona: bool = Field(
+        description="True si el pago fue a una persona con nombre propio (Yape, Plin, transferencia) y no a un negocio."
+    )
+    categoria_indicada: bool = Field(
+        description="True solo si el texto o pie de foto indica claramente la categoría, o si aplica una regla de la persona."
+    )
 
 
 # --- Google Sheets (vía Apps Script) ---
@@ -101,7 +116,17 @@ def extraer(imagen: Optional[bytes], mime: str, texto: Optional[str]) -> Gasto:
         "en esos casos es_gasto es true, el comercio es lo que describe y la fecha es hoy "
         "salvo que diga otra (ayer, el lunes, una fecha). "
         "Si el texto o la imagen no tiene ningún gasto, pon es_gasto en false. "
-        f"Categorías válidas: {', '.join(CATEGORIAS)}."
+        f"Categorías válidas: {', '.join(CATEGORIAS)}. "
+        "Reglas: "
+        "(1) Pon es_persona en true cuando el pago fue a una persona con nombre propio "
+        "(Yape, Plin o transferencia) y no a un negocio. "
+        "(2) Pon categoria_indicada en true solo si el texto o el pie de foto dice claramente "
+        "la categoría (por ejemplo 'almuerzo', 'pasaje', 'préstamo') o si aplica una regla extra; "
+        "en ese caso usa esa categoría. "
+        "(3) Si es un pago a una persona y no hay ninguna pista, pon categoria_indicada en false "
+        "y categoria Transferencias. "
+        "(4) En pagos a negocios, elige la categoría por el tipo de negocio y pon categoria_indicada en true. "
+        + " ".join(f"Regla extra: {r}." for r in REGLAS_EXTRA)
     )
     entrada = [{"type": "text", "text": instruccion}]
     if texto:
@@ -123,6 +148,17 @@ def extraer(imagen: Optional[bytes], mime: str, texto: Optional[str]) -> Gasto:
 
 
 # --- Handlers de Telegram ---
+PENDIENTES: dict = {}  # gastos a personas esperando que elijas categoría
+
+
+def _teclado(token: str) -> InlineKeyboardMarkup:
+    botones = [
+        InlineKeyboardButton(c, callback_data=f"cat:{token}:{i}")
+        for i, c in enumerate(CATEGORIAS)
+    ]
+    return InlineKeyboardMarkup([botones[i : i + 3] for i in range(0, len(botones), 3)])
+
+
 def es_dueña(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == OWNER_ID
 
@@ -139,16 +175,46 @@ async def procesar(update: Update, imagen: Optional[bytes], mime: str, texto: Op
         await aviso.edit_text("No encontré un gasto en eso. ¿Es un voucher?")
         return
     fecha = g.fecha or datetime.now(TZ).strftime("%Y-%m-%d")
+    if g.es_persona and not g.categoria_indicada:
+        token = uuid.uuid4().hex[:8]
+        PENDIENTES[token] = (g, fecha)
+        while len(PENDIENTES) > 50:
+            PENDIENTES.pop(next(iter(PENDIENTES)))
+        await aviso.edit_text(
+            f"{g.moneda} {g.monto:.2f} a {g.comercio or 'una persona'} · {fecha}\n"
+            "¿En qué categoría lo pongo?",
+            reply_markup=_teclado(token),
+        )
+        return
+    await registrar(aviso, g, fecha)
+
+
+async def registrar(mensaje, g: Gasto, fecha: str):
     try:
         await asyncio.to_thread(guardar, g, fecha)
     except Exception:
         log.exception("Error con Google Sheets")
-        await aviso.edit_text("Lo leí pero no pude guardarlo en la hoja.")
+        await mensaje.edit_text("Lo leí pero no pude guardarlo en la hoja.")
         return
     cat = g.categoria if g.categoria in CATEGORIAS else "Otros"
-    await aviso.edit_text(
+    await mensaje.edit_text(
         f"✅ {g.moneda} {g.monto:.2f} · {cat}\n{g.comercio or 'Sin comercio'} · {fecha}"
     )
+
+
+async def on_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != OWNER_ID:
+        return
+    _, token, idx = q.data.split(":")
+    pendiente = PENDIENTES.pop(token, None)
+    if not pendiente:
+        await q.message.edit_text("Esto ya expiró. Vuelve a enviar el voucher.")
+        return
+    g, fecha = pendiente
+    g.categoria = CATEGORIAS[int(idx)]
+    await registrar(q.message, g, fecha)
 
 
 async def on_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,6 +309,7 @@ def main():
         .build()
     )
     app.add_error_handler(on_error)
+    app.add_handler(CallbackQueryHandler(on_categoria, pattern="^cat:"))
     app.add_handler(CommandHandler("resumen", resumen))
     app.add_handler(CommandHandler("ultimos", ultimos))
     app.add_handler(MessageHandler(filters.PHOTO, on_foto))
